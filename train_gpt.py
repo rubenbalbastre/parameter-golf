@@ -69,6 +69,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    local_attention_heads = int(os.environ.get("LOCAL_ATTENTION_HEADS", 4))
+    local_attention_window = int(os.environ.get("LOCAL_ATTENTION_WINDOW", 256))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -560,14 +562,28 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        local_attention_heads: int,
+        local_attention_window: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.q_per_kv = num_heads // num_kv_heads
+        if local_attention_heads < 0 or local_attention_heads > num_heads:
+            raise ValueError("local_attention_heads must be in [0, num_heads]")
+        if local_attention_heads % self.q_per_kv != 0:
+            raise ValueError("local_attention_heads must align with GQA groups")
+        if local_attention_window <= 0:
+            raise ValueError("local_attention_window must be positive")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.local_attention_heads = local_attention_heads
+        self.local_attention_window = local_attention_window
+        self.local_kv_heads = local_attention_heads // self.q_per_kv
+        self.global_attention_heads = num_heads - local_attention_heads
+        self.global_kv_heads = num_kv_heads - self.local_kv_heads
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -579,6 +595,25 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self._local_mask_cache: Tensor | None = None
+        self._local_mask_seq_len = 0
+        self._local_mask_device: torch.device | None = None
+
+    def _local_causal_mask(self, seqlen: int, device: torch.device) -> Tensor:
+        if (
+            self._local_mask_cache is None
+            or self._local_mask_seq_len != seqlen
+            or self._local_mask_device != device
+        ):
+            pos = torch.arange(seqlen, device=device)
+            dist = pos[:, None] - pos[None, :]
+            valid = (dist >= 0) & (dist < self.local_attention_window)
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=torch.float32)
+            mask.masked_fill_(valid, 0.0)
+            self._local_mask_cache = mask
+            self._local_mask_seq_len = seqlen
+            self._local_mask_device = device
+        return self._local_mask_cache
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -591,14 +626,49 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.local_attention_heads == 0:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        elif self.local_attention_heads == self.num_heads:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=self._local_causal_mask(seqlen, x.device),
+                is_causal=False,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            y_parts = []
+            if self.local_attention_heads > 0:
+                y_parts.append(
+                    F.scaled_dot_product_attention(
+                        q[:, :self.local_attention_heads],
+                        k[:, :self.local_kv_heads],
+                        v[:, :self.local_kv_heads],
+                        attn_mask=self._local_causal_mask(seqlen, x.device),
+                        is_causal=False,
+                        enable_gqa=(self.local_kv_heads != self.local_attention_heads),
+                    )
+                )
+            if self.global_attention_heads > 0:
+                y_parts.append(
+                    F.scaled_dot_product_attention(
+                        q[:, self.local_attention_heads:],
+                        k[:, self.local_kv_heads:],
+                        v[:, self.local_kv_heads:],
+                        attn_mask=None,
+                        is_causal=True,
+                        enable_gqa=(self.global_kv_heads != self.global_attention_heads),
+                    )
+                )
+            y = torch.cat(y_parts, dim=1)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -626,11 +696,21 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        local_attention_heads: int,
+        local_attention_window: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            local_attention_heads,
+            local_attention_window,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +739,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        local_attention_heads: int,
+        local_attention_window: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +762,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    local_attention_heads,
+                    local_attention_window,
                 )
                 for i in range(num_layers)
             ]
@@ -835,6 +919,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        local_attention_heads=args.local_attention_heads,
+        local_attention_window=args.local_attention_window,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -896,7 +982,13 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.local_attention_heads > 0:
+        log0(
+            f"attention_mode:mixed_local_global num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
+            f"local_heads:{args.local_attention_heads} local_window:{args.local_attention_window}"
+        )
+    else:
+        log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
