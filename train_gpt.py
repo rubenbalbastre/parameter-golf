@@ -69,7 +69,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    local_attention_heads = int(os.environ.get("LOCAL_ATTENTION_HEADS", 4))
+    local_attention_heads = int(os.environ.get("LOCAL_ATTENTION_HEADS", 2))
     local_attention_window = int(os.environ.get("LOCAL_ATTENTION_WINDOW", 256))
 
     # Optimizer hyperparameters.
@@ -615,6 +615,20 @@ class CausalSelfAttention(nn.Module):
             self._local_mask_device = device
         return self._local_mask_cache
 
+    def _repeat_kv_for_gqa(self, x: Tensor, kv_heads: int, q_heads: int) -> Tensor:
+        if kv_heads == q_heads:
+            return x
+        repeat_factor = q_heads // kv_heads
+        return x.repeat_interleave(repeat_factor, dim=1)
+
+    def _local_attention(self, q: Tensor, k: Tensor, v: Tensor, seqlen: int) -> Tensor:
+        k = self._repeat_kv_for_gqa(k, k.size(1), q.size(1))
+        v = self._repeat_kv_for_gqa(v, v.size(1), q.size(1))
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        scores = scores + self._local_causal_mask(seqlen, q.device).to(dtype=scores.dtype)
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+        return torch.matmul(probs, v)
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -636,27 +650,16 @@ class CausalSelfAttention(nn.Module):
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         elif self.local_attention_heads == self.num_heads:
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=self._local_causal_mask(seqlen, x.device),
-                is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
+            y = self._local_attention(q, k, v, seqlen)
         else:
             y_parts = []
             if self.local_attention_heads > 0:
-                y_parts.append(
-                    F.scaled_dot_product_attention(
-                        q[:, :self.local_attention_heads],
-                        k[:, :self.local_kv_heads],
-                        v[:, :self.local_kv_heads],
-                        attn_mask=self._local_causal_mask(seqlen, x.device),
-                        is_causal=False,
-                        enable_gqa=(self.local_kv_heads != self.local_attention_heads),
-                    )
-                )
+                y_parts.append(self._local_attention(
+                    q[:, :self.local_attention_heads],
+                    k[:, :self.local_kv_heads],
+                    v[:, :self.local_kv_heads],
+                    seqlen,
+                ))
             if self.global_attention_heads > 0:
                 y_parts.append(
                     F.scaled_dot_product_attention(
