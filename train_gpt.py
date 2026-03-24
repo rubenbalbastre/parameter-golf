@@ -52,8 +52,9 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 10000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    lr_warmdown_iters = int(os.environ.get("LR_WARMDOWN_ITERS", 2000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    lr_warmup_iters = int(os.environ.get("LR_WARMUP_ITERS", 250))
     min_lr_mul = float(os.environ.get("MIN_LR_MUL", 0.1))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1018,17 +1019,24 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        if args.lr_warmdown_iters <= 0:
+            if args.lr_warmup_iters > 0 and step < args.lr_warmup_iters:
+                return step / max(args.lr_warmup_iters, 1)
             return 1.0
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            if args.lr_warmup_iters > 0 and step < args.lr_warmup_iters:
+                return step / max(args.lr_warmup_iters, 1)
+            warmdown_start = max(args.iterations - args.lr_warmdown_iters, 0)
             if step < warmdown_start:
                 return 1.0
-            progress = min((step - warmdown_start) / max(args.warmdown_iters, 1), 1.0)
+            progress = min((step - warmdown_start) / max(args.lr_warmdown_iters, 1), 1.0)
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             return args.min_lr_mul + (1.0 - args.min_lr_mul) * cosine
         step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
+        warmup_ms = args.lr_warmup_iters * step_ms
+        if args.lr_warmup_iters > 0 and elapsed_ms < warmup_ms:
+            return elapsed_ms / max(warmup_ms, 1e-9)
+        warmdown_ms = args.lr_warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         if remaining_ms > warmdown_ms:
             return 1.0
