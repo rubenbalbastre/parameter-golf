@@ -443,52 +443,108 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
+class ShardReader:
+    # Lightweight shard index with fixed token counts + slicing reads.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
-        self.pos = 0
+        self.header_bytes = 256 * np.dtype("<i4").itemsize
+        self.token_bytes = np.dtype("<u2").itemsize
+        self.num_tokens: list[int] = []
+        for file in self.files:
+            header = np.fromfile(file, dtype="<i4", count=256)
+            if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+                raise ValueError(f"Unexpected shard header for {file}")
+            n = int(header[2])
+            expected_size = self.header_bytes + n * self.token_bytes
+            if file.stat().st_size != expected_size:
+                raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+            self.num_tokens.append(n)
 
-    def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
+    def advance_cursor(self, file_idx: int, pos: int, n: int) -> tuple[int, int]:
+        remaining = n
+        idx = file_idx
+        p = pos
+        while remaining > 0:
+            avail = self.num_tokens[idx] - p
+            if avail <= 0:
+                idx = (idx + 1) % len(self.files)
+                p = 0
+                continue
+            if remaining < avail:
+                p += remaining
+                remaining = 0
+            else:
+                remaining -= avail
+                idx = (idx + 1) % len(self.files)
+                p = 0
+        return idx, p
 
-    def take(self, n: int) -> Tensor:
+    def read_span(self, file_idx: int, pos: int, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
+        idx = file_idx
+        p = pos
         while remaining > 0:
-            avail = self.tokens.numel() - self.pos
+            avail = self.num_tokens[idx] - p
             if avail <= 0:
-                self._advance_file()
+                idx = (idx + 1) % len(self.files)
+                p = 0
                 continue
             k = min(remaining, avail)
-            chunks.append(self.tokens[self.pos : self.pos + k])
-            self.pos += k
+            mm = np.memmap(
+                self.files[idx],
+                dtype="<u2",
+                mode="r",
+                offset=self.header_bytes,
+                shape=(self.num_tokens[idx],),
+            )
+            view = mm[p : p + k]
+            chunks.append(torch.from_numpy(np.asarray(view)))
+            p += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
+    # Each call consumes a contiguous chunk from a shared global cursor, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.reader = ShardReader(pattern)
+        # Global cursor state (only advanced on rank 0).
+        self.file_idx = 0
+        self.pos = 0
+        self._cursor_tensor: Tensor | None = None
+
+    def _broadcast_cursor(self, file_idx: int, pos: int) -> tuple[int, int]:
+        if not (dist.is_available() and dist.is_initialized()) or self.world_size == 1:
+            return file_idx, pos
+        if self._cursor_tensor is None:
+            self._cursor_tensor = torch.empty((2,), dtype=torch.int64, device=self.device)
+        if self.rank == 0:
+            self._cursor_tensor[0] = file_idx
+            self._cursor_tensor[1] = pos
+        dist.broadcast(self._cursor_tensor, src=0)
+        return int(self._cursor_tensor[0].item()), int(self._cursor_tensor[1].item())
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        total_span = per_rank_span * self.world_size
+        if self.rank == 0:
+            start_file, start_pos = self.file_idx, self.pos
+            self.file_idx, self.pos = self.reader.advance_cursor(self.file_idx, self.pos, total_span)
+        else:
+            start_file, start_pos = 0, 0
+        start_file, start_pos = self._broadcast_cursor(start_file, start_pos)
+        rank_start_file, rank_start_pos = self.reader.advance_cursor(
+            start_file, start_pos, self.rank * per_rank_span
+        )
+        local = self.reader.read_span(rank_start_file, rank_start_pos, per_rank_span).to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
