@@ -547,6 +547,7 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+        self.gate = nn.Parameter(torch.full((model_dim,), -2.0, dtype=torch.float32))
     def bigram_hash(self, tokens: Tensor) -> Tensor:
         t = tokens.to(torch.int32)
         mod = self.bigram_vocab_size - 1
@@ -558,7 +559,8 @@ class BigramHashEmbedding(nn.Module):
         h = self.embed(self.bigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
+        gate = torch.sigmoid(self.gate.to(dtype=h.dtype))[None, None, :]
+        return h * self.scale.to(dtype=h.dtype) * gate
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
     Each table maps vocab tokens to a low-dim embedding, projected to model_dim."""
@@ -1075,6 +1077,7 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+        scalar_params.append(base_model.bigram.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
