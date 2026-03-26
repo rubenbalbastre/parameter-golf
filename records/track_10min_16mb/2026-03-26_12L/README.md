@@ -24,5 +24,17 @@ Experiment 2:
 Stays under 16MB by 0.2MB on seed 1337. Not checked others because of costs.
 DIAGNOSTIC post_ema val_bpb:1.1430 vs val_bpb: 1.1379 from previous record
 
+Experiment 3:
+
+* NUM_LAYERS: 11 -> 12
+* MLP_MULT: 3.0 -> 2.6
+* BIGRAM_VOCAB_SIZE: 2048 -> 2048
+* BIGRAM_DIM: 128 -> 256
+* VE_DIM: 128 -> 256
+
+Stays above 16MB by 0.1MB on seed 1337. Not checked others.
+DIAGNOSTIC post_ema val_bpb:1.1407 vs val_bpb: 1.1379 from previous record
 
 Others combinations reducing ML_MULP to 2.5 and mantaining VE_DIM and BIGRAM configuration exceed size or didnt improve at all.
+
+Notes: expected improvement of loss per step (0.01 bpb at step 4000) but since model trains slower it does not achieve better bpb.
